@@ -1,0 +1,244 @@
+#!/usr/bin/perl
+
+use perl_modules::common;
+use strict;
+use Getopt::Long;
+
+my $delim = ",";
+
+# Parsing the command line arguments
+my $appl_name;
+GetOptions("appl_name|a=s" => \$appl_name);
+unless ($appl_name)
+{
+	print "\nPlease provide the appliance name.. Which appliance?\n";
+	exit;
+}
+
+# Loading the configurations from file
+execute(load_config($appl_name));
+
+# Login to appliance with default user and password
+my $appliance = execute_ssh(login($cfg{"appliance_ip"}, $cfg{"appliance_username"}, $cfg{"appliance_password"}));
+
+# Login to Server and Client
+my $server = execute_ssh(login($cfg{"server_ip"}, $cfg{"server_username"}, $cfg{"server_password"}));
+my $client = execute_ssh(login($cfg{"client_ip"}, $cfg{"client_username"}, $cfg{"client_password"}));
+
+# Check bypass is off
+execute_not(is_bypass_on($appliance));
+
+# Check shaping is on, unless turn on it
+unless(is_shaping_on($appliance) eq $SUCCESS)
+{
+	print $appliance "policy\nset shaping on\n";
+	unless($appliance->expect(5, "Shaping turned on successfully"))
+	{
+		execute("Failed to turn on Shaping.\n");
+		exit;
+	}
+}
+
+# Create a pattern
+my $pattern_name = "pattern_iperf";
+my $pattern_format = "port: 5002";
+execute(create_pattern($appliance, $pattern_name, $pattern_format));
+
+
+
+# Create a class
+#my $predef_pattname = "ftp_rule";
+my $class_name = "test_pipe_min";
+execute(create_class($appliance, $class_name, $LINK0, $pattern_name));
+
+# sync after create class
+print $appliance "sync\n";
+unless($appliance->expect(30, "Activated new patterns and classes successfully"))
+{
+	execute("Failed to sync. $appliance->before()\n");
+	exit;
+}
+
+my $iperf_server_id = 0;
+my $iperf_client_id = 0;
+
+# Start iperf server listening on 5001 and 5002 ports
+execute(start_iperf_server($server, \$iperf_server_id, " -u -p 5001"));
+execute(start_iperf_server($server, \$iperf_server_id, " -u -p 5002"));
+
+#execute(start_iperf_client($client, \$iperf_client_id, " -u -b 2M -t 120"));
+
+
+# Load test parameters from the local file "rate_conf"
+my $local_session=Expect->new();
+$local_session->log_stdout(0);
+$local_session->send(`cat rate_conf\n`);
+$local_session->expect(1,"cat");
+my $after = $local_session->before();
+
+my @cat_output = split("\n",$after);
+
+foreach (@cat_output) 
+{
+	#print "This element is $_\n";
+	my ($conf_string) = $_;
+	my @str = split($delim, $conf_string);
+=foreach (@str) 
+	{
+		print " $_ \n";
+	}
+=cut	
+	# Modifying the WAN speed
+	my $wan_speed_in  = "@str[2]";
+	my $wan_speed_out = "@str[2]";
+	execute(set_wan_speed($appliance, $LINK0, $wan_speed_in, $wan_speed_out));
+	
+	print $appliance "policy\n new pipe min @str[0] burstmax: @str[2] $class_name\n";
+	my $match = "Added new pipe min:" . @str[0] . "kbps, max:" . @str[2] . "kbps for class $class_name (any)successfully";
+	unless($appliance->expect(1, $match))
+	{
+		execute("Failed to assign pipe min for $class_name.\n");
+		exit;
+	}
+	
+	print_log($ANY, "Test starting with the Config.\nOther Traffic - no_of_flows: @str[4], flow_duration: @str[5], flow_rate :@str[6]\nTraffic in class no_of_flows: @str[7], flow_duration: @str[8], flow_rate :@str[9]");
+	my $first = use_this_configuration($_);
+	my $second = use_this_configuration($_);
+	my $third = use_this_configuration($_);
+	
+	print_log($ANY, "Test Result : $first $second $third");
+	print "Test Result : $first $second $third";
+}
+
+
+# Closing the sessions
+$appliance->soft_close();
+$server->soft_close();
+$client->soft_close();
+
+
+#-------------------------------------------------------------------------------
+sub start_iperf_clients
+{
+	my ($session, $pid_ref, $server_ip, $no_of_flows, $flow_duration, $total_duration, $flow_rate, $option) = @_;
+	my $seconds_to_run;
+	unless(defined $server_ip)
+	{
+		return "Please provide server ip.\n";
+	}
+	unless(defined $no_of_flows)
+	{
+		$no_of_flows = 1;
+	}
+	unless(defined $flow_duration)
+	{
+		$flow_duration = 120;
+		$seconds_to_run = 1;
+	}
+	unless(defined $total_duration)
+	{
+		$total_duration = 120;
+	}
+	unless(defined $flow_rate)
+	{
+		$flow_rate = 15;
+	}
+	
+	if($flow_rate < 15)
+	{
+		$flow_rate = 15;
+	}
+	if($flow_duration < 120)
+	{
+		$seconds_to_run = 120;
+	}
+	my $options;
+	#for(my $i = 0; $i < $seconds_to_run ; $i++ )
+	#{	
+		if( $no_of_flows <= 350 && $no_of_flows > 0)
+		{
+			$options = " -c $server_ip -t $flow_duration -u -b $flow_rate"."K -P $no_of_flows ".$option;
+			execute(start_iperf_client($session, $pid_ref, $options));
+		}elsif($no_of_flows > 0)
+		{
+			my $thread_count = $no_of_flows;
+			
+			for (my $j=0; $j <= $no_of_flows; $j+=350) 
+			{	
+				if($thread_count >= 350 && ($thread_count / 350) > 0)
+				{
+					$options = " -c $server_ip -t $flow_duration -u -b $flow_rate"."K -P 350 ".$option;
+				}elsif($thread_count <= 350)
+				{
+					$options = " -c $server_ip -t $flow_duration -u -b $flow_rate"."K -P ".$thread_count." ".$option;
+				}
+				execute(start_iperf_client($session, $pid_ref, $options));
+				$thread_count -= 350;
+			}
+		}else
+		{
+			return "Cannot start iperf Clients\n";
+		}
+	#	sleep(1);
+	#}
+	return $SUCCESS;
+}
+
+#-------------------------------------------------------------------------------
+sub use_this_configuration
+{
+	my $pid;
+	my %stats = ();
+	my $test_duration = 120;
+	my $bw_other = 0;
+	my $bw_class = 0;
+	my $data_other = 0;
+	my $data_class = 0;
+
+	
+	my ($conf_string) = $_;
+	my @str1 = split($delim, $conf_string);
+	#foreach (@str1) 
+	#{
+	#	print " $_ \n";
+	#}
+	#$local_session, $pid_ref, $server_ip, $no_of_flows, $flow_duration, $total_duration, $flow_rate, $option
+	#32,,1000,U,5,10,15,1,120,200,,250,200,32,
+	start_iperf_clients($client, \$pid, "9.0.0.1", @str1[4], @str1[5], $test_duration, @str1[6], " -p 5001");	# Other Traffic
+	sleep(1);
+	start_iperf_clients($client, \$pid, "9.0.0.1", @str1[7], @str1[8], $test_duration, @str1[9], " -p 5002");	# Class Traffic
+	
+	sleep (65);	
+	
+	execute(get_link_stats($appliance, \%stats, $LINK0));
+	execute(get_class_stats($appliance, \%stats, $class_name));
+	
+	$bw_other = @str1[4] * @str1[6];
+	$bw_class = @str1[7] * @str1[9];
+	$data_other = @str1[4] * @str1[4] * @str1[6];
+	$data_class = @str1[7] * @str1[8] * @str1[9];
+	
+	print_log($OUT, "Badwidth usage in other Traffic " . $bw_other . "Kbps\n");
+	print_log($OUT, "Badwidth usage in class Traffic " . $bw_class . "Kbps\n");
+	print_log($OUT, "Data transfer in other Traffic " . ($data_other / 8) . "KB\n");
+	print_log($OUT, "Data transfer in class Traffic " . ($data_class / 8) . "KB\n");
+	
+	sleep (65);
+
+	unless($bw_class <= $stats{"in_tx_Kbps"}) #in_rx_Kbps
+	{
+		return "Expected and Bandwidth is not matching.\n";
+	}
+	unless($stats{"in_flow_count"} == (@str1[4] + @str1[7]) || ($stats{"out_flow_count"} == (@str1[4] + @str1[7])))
+	{
+		return "Flow count is not matching.\n";
+	}
+	
+	#print "ext Bandwidth usage Received: ".(($stats{"ext_rx_Bps"} * 8 ) / 1024)."Kbps\n";
+	#print "ext Bandwidth usage Transmitted: ".(($stats{"ext_tx_Bps"} * 8 ) / 1024)."Kbps\n";
+	#print "\n\n";
+			
+	return $SUCCESS;
+}
+
+
